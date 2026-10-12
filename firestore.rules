@@ -1,0 +1,79 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // 관리자 목록: 콘솔에서만 직접 추가합니다 (클라이언트 쓰기 불가)
+    match /admins/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // 회원: 본인 문서만 읽기, 가입 시 잔액은 0 으로만 생성 가능
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.balance == 0
+        && request.resource.data.keys().hasOnly(['nickname', 'email', 'balance', 'createdAt']);
+      allow update: if isAdmin() || (
+        // 구매 시에만 잔액 차감 허용: 같은 요청에서 상품이 내 이름으로 sold 처리되어야 하고
+        // 차감액이 상품 가격과 정확히 일치해야 합니다.
+        signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'lastItem'])
+        && get(/databases/$(database)/documents/items/$(request.resource.data.lastItem)).data.status == 'available'
+        && getAfter(/databases/$(database)/documents/items/$(request.resource.data.lastItem)).data.status == 'sold'
+        && getAfter(/databases/$(database)/documents/items/$(request.resource.data.lastItem)).data.buyerUid == uid
+        && request.resource.data.balance >= 0
+        && request.resource.data.balance == resource.data.balance
+             - get(/databases/$(database)/documents/items/$(request.resource.data.lastItem)).data.price
+      );
+    }
+
+    // 판매 상품(공개 정보). 계정 로그인 정보는 여기 없습니다.
+    match /items/{id} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        signedIn()
+        && resource.data.status == 'available'
+        && request.resource.data.status == 'sold'
+        && request.resource.data.buyerUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'buyerUid', 'soldAt'])
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.lastItem == id
+      );
+    }
+
+    // 계정 로그인 정보(비공개): 관리자 또는 구매자 본인만 읽기
+    match /secrets/{id} {
+      allow read: if isAdmin() || (
+        signedIn()
+        && exists(/databases/$(database)/documents/items/$(id))
+        && get(/databases/$(database)/documents/items/$(id)).data.buyerUid == request.auth.uid
+      );
+      allow write: if isAdmin();
+    }
+
+    // 주문 내역
+    match /orders/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // 충전 요청 (무통장 입금 후 관리자가 승인)
+    match /chargeRequests/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.amount is number
+        && request.resource.data.amount >= 1000
+        && request.resource.data.amount <= 10000000;
+      allow update, delete: if isAdmin();
+    }
+  }
+}
